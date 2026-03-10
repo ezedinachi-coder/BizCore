@@ -255,6 +255,90 @@ backend:
         agent: "testing"
         comment: "Reports API verified: GET /reports/stock-summary returned 7 detailed inventory records with product names, SKUs, quantities, values, and low stock indicators."
 
+  - task: "Expenses API"
+    implemented: true
+    working: true
+    file: "/app/backend/server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: true
+        agent: "testing"
+        comment: "Expenses API fully functional: GET /expenses (found 2 existing), POST /expenses (created expense with category 'office'), PUT /expenses/{id}/approve (approval working), DELETE /expenses/{id} (deletion working). Complete CRUD operations verified."
+
+  - task: "Quotations API"
+    implemented: true
+    working: false
+    file: "/app/backend/server.py"
+    stuck_count: 1
+    priority: "high"
+    needs_retesting: true
+    status_history:
+      - working: false
+        agent: "testing"
+        comment: "Quotations API partially working: GET /quotations (found 3 existing), POST /quotations (created quotation successfully), PUT /quotations/{id}/status (status update to 'accepted' working). ISSUE: POST /quotations/{id}/convert-to-order failing with 422 error - missing warehouse_id parameter in query despite being passed correctly."
+
+  - task: "Delivery Notes API"
+    implemented: true
+    working: true
+    file: "/app/backend/server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: true
+        agent: "testing"
+        comment: "Delivery Notes API fully functional: GET /delivery-notes (found 2 existing), POST /delivery-notes (created delivery note with real SO ID), PUT /delivery-notes/{id}/status (status update to 'delivered' working). All operations working correctly."
+
+  - task: "Bill of Materials (BOM) API"
+    implemented: true
+    working: true
+    file: "/app/backend/server.py"
+    stuck_count: 0
+    priority: "medium"
+    needs_retesting: false
+    status_history:
+      - working: true
+        agent: "testing"
+        comment: "BOM API working: GET /bom (found 1 existing), POST /bom (created BOM with finished product successfully), GET /bom/{product_id} returns 404 when no BOM exists (expected behavior). BOM creation validation working correctly - requires finished products only."
+
+  - task: "Enhanced Reports API"
+    implemented: true
+    working: false
+    file: "/app/backend/server.py"
+    stuck_count: 1
+    priority: "medium"
+    needs_retesting: true
+    status_history:
+      - working: false
+        agent: "testing"
+        comment: "Enhanced Reports mostly working: P&L Report (Net Profit: 604.95), Cash Flow Report (Net Cash Flow: 0.0), Supplier Aging Report (Total Outstanding: 0), Inventory Valuation Report (Total Value: 0) all working. CRITICAL BUG: Customer Aging Report returns 500 Internal Server Error due to datetime timezone issue in line 2538 of server.py."
+
+  - task: "Audit Logs API"
+    implemented: true
+    working: true
+    file: "/app/backend/server.py"
+    stuck_count: 0
+    priority: "low"
+    needs_retesting: false
+    status_history:
+      - working: true
+        agent: "testing"
+        comment: "Audit Logs API working perfectly: GET /audit-logs retrieved 27 audit log entries with latest log showing 'create on bom'. Audit trail is functioning and capturing all system activities correctly."
+
+  - task: "Notifications API"
+    implemented: true
+    working: true
+    file: "/app/backend/server.py"
+    stuck_count: 0
+    priority: "low"
+    needs_retesting: false
+    status_history:
+      - working: true
+        agent: "testing"
+        comment: "Notifications API working: GET /notifications/generate-alerts generated 2 system alerts including low stock alerts for 'Copper Wire 2mm' and other products. Alert generation system functioning correctly."
+
 frontend:
   - task: "Login Screen with Google OAuth"
     implemented: true
@@ -336,9 +420,11 @@ metadata:
 
 test_plan:
   current_focus:
-    - "Authentication flow"
-    - "Dashboard data loading"
-  stuck_tasks: []
+    - "Quotations API convert-to-order endpoint"
+    - "Customer aging report backend bug"
+  stuck_tasks:
+    - "Quotations API convert-to-order parameter issue"
+    - "Customer aging report timezone bug"
   test_all: false
   test_priority: "high_first"
 
@@ -347,3 +433,5 @@ agent_communication:
     message: "BizCore MVP implemented with full backend API and mobile frontend. Backend tested with curl, all APIs working. Frontend login screen visible. Need to test authenticated screens."
   - agent: "testing"
     message: "Comprehensive backend testing completed. All 28 API endpoints tested with 100% success rate. Authentication, Dashboard, Products, Inventory, Suppliers, Distributors, Purchase Orders, Sales Orders, Warehouses, and Reports all working correctly with session token test_session_1773136094446. Backend APIs are fully functional."
+  - agent: "testing"
+    message: "NEW FEATURES TESTING COMPLETED: Tested 7 new feature categories with 23 specific API endpoints. SUCCESS: Expenses API (4/4 endpoints), Delivery Notes API (3/3 endpoints), BOM API (3/4 endpoints), Audit Logs API (1/1 endpoint), Notifications API (1/1 endpoint), Enhanced Reports (4/5 endpoints). ISSUES FOUND: 1) Quotations convert-to-order endpoint has parameter parsing issue, 2) Customer aging report has critical datetime timezone bug causing 500 error. Overall: 85% success rate on new features."

@@ -1700,6 +1700,18 @@ async def get_sales_analysis_report(
 # AUDIT LOG ENDPOINTS
 # ========================
 
+async def create_audit_log(user_id: str, action: str, entity_type: str, entity_id: str, old_value: dict = None, new_value: dict = None):
+    """Helper function to create audit logs"""
+    log = AuditLog(
+        user_id=user_id,
+        action=action,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        old_value=old_value,
+        new_value=new_value
+    )
+    await db.audit_logs.insert_one(log.model_dump())
+
 @api_router.get("/audit-logs")
 async def get_audit_logs(
     entity_type: Optional[str] = None,
@@ -1715,7 +1727,978 @@ async def get_audit_logs(
         query["entity_type"] = entity_type
     
     logs = await db.audit_logs.find(query, {"_id": 0}).sort("timestamp", -1).to_list(limit)
+    
+    # Enrich with user names
+    for log in logs:
+        user_doc = await db.users.find_one({"user_id": log.get("user_id")}, {"_id": 0, "name": 1})
+        log["user_name"] = user_doc.get("name") if user_doc else "Unknown"
+    
     return logs
+
+# ========================
+# EXPENSE TRACKING ENDPOINTS
+# ========================
+
+class ExpenseCategory(str, Enum):
+    OFFICE = "office"
+    TRAVEL = "travel"
+    UTILITIES = "utilities"
+    SALARY = "salary"
+    MARKETING = "marketing"
+    MAINTENANCE = "maintenance"
+    SUPPLIES = "supplies"
+    OTHER = "other"
+
+class Expense(BaseModel):
+    expense_id: str = Field(default_factory=lambda: f"exp_{uuid.uuid4().hex[:12]}")
+    category: ExpenseCategory
+    amount: float
+    description: str
+    vendor: Optional[str] = None
+    receipt_image: Optional[str] = None  # Base64 encoded
+    expense_date: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    payment_method: PaymentMethod = PaymentMethod.CASH
+    approved: bool = False
+    approved_by: Optional[str] = None
+    created_by: str
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class ExpenseCreate(BaseModel):
+    category: ExpenseCategory
+    amount: float
+    description: str
+    vendor: Optional[str] = None
+    receipt_image: Optional[str] = None
+    expense_date: Optional[datetime] = None
+    payment_method: PaymentMethod = PaymentMethod.CASH
+
+@api_router.get("/expenses")
+async def get_expenses(
+    category: Optional[ExpenseCategory] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    approved_only: bool = False,
+    user: User = Depends(get_current_user)
+):
+    """Get all expenses"""
+    query = {}
+    if category:
+        query["category"] = category.value
+    if approved_only:
+        query["approved"] = True
+    if start_date:
+        query["expense_date"] = {"$gte": datetime.fromisoformat(start_date)}
+    if end_date:
+        if "expense_date" in query:
+            query["expense_date"]["$lte"] = datetime.fromisoformat(end_date)
+        else:
+            query["expense_date"] = {"$lte": datetime.fromisoformat(end_date)}
+    
+    expenses = await db.expenses.find(query, {"_id": 0}).sort("expense_date", -1).to_list(1000)
+    return expenses
+
+@api_router.post("/expenses")
+async def create_expense(expense_data: ExpenseCreate, user: User = Depends(get_current_user)):
+    """Create an expense"""
+    expense_dict = expense_data.model_dump(exclude={'expense_date'})
+    expense = Expense(
+        **expense_dict,
+        expense_date=expense_data.expense_date or datetime.now(timezone.utc),
+        created_by=user.user_id
+    )
+    await db.expenses.insert_one(expense.model_dump())
+    await create_audit_log(user.user_id, "create", "expense", expense.expense_id)
+    return expense.model_dump()
+
+@api_router.put("/expenses/{expense_id}/approve")
+async def approve_expense(expense_id: str, user: User = Depends(get_current_user)):
+    """Approve an expense (manager only)"""
+    if user.role not in [UserRole.SUPER_ADMIN, UserRole.MANAGER, UserRole.ACCOUNTANT]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    await db.expenses.update_one(
+        {"expense_id": expense_id},
+        {"$set": {"approved": True, "approved_by": user.user_id}}
+    )
+    await create_audit_log(user.user_id, "approve", "expense", expense_id)
+    return {"message": "Expense approved"}
+
+@api_router.delete("/expenses/{expense_id}")
+async def delete_expense(expense_id: str, user: User = Depends(get_current_user)):
+    """Delete an expense"""
+    await db.expenses.delete_one({"expense_id": expense_id})
+    await create_audit_log(user.user_id, "delete", "expense", expense_id)
+    return {"message": "Expense deleted"}
+
+# ========================
+# QUOTATION ENDPOINTS
+# ========================
+
+class QuotationStatus(str, Enum):
+    DRAFT = "draft"
+    SENT = "sent"
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+    EXPIRED = "expired"
+
+class QuotationItem(BaseModel):
+    item_id: str = Field(default_factory=lambda: f"qi_{uuid.uuid4().hex[:12]}")
+    product_id: str
+    product_name: Optional[str] = None
+    quantity: float
+    unit_price: float
+    discount_percent: float = 0.0
+
+class Quotation(BaseModel):
+    quotation_id: str = Field(default_factory=lambda: f"qt_{uuid.uuid4().hex[:12]}")
+    quotation_number: str
+    distributor_id: str
+    distributor_name: Optional[str] = None
+    items: List[QuotationItem] = []
+    subtotal: float = 0.0
+    discount_amount: float = 0.0
+    tax_amount: float = 0.0
+    total_amount: float = 0.0
+    valid_until: datetime
+    status: QuotationStatus = QuotationStatus.DRAFT
+    notes: Optional[str] = None
+    terms: Optional[str] = None
+    created_by: Optional[str] = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class QuotationItemCreate(BaseModel):
+    product_id: str
+    quantity: float
+    unit_price: float
+    discount_percent: float = 0.0
+
+class QuotationCreate(BaseModel):
+    distributor_id: str
+    items: List[QuotationItemCreate] = []
+    tax_amount: float = 0.0
+    valid_days: int = 30
+    notes: Optional[str] = None
+    terms: Optional[str] = None
+
+async def generate_quotation_number():
+    count = await db.quotations.count_documents({})
+    return f"QT-{datetime.now().strftime('%Y%m')}-{count + 1:04d}"
+
+@api_router.get("/quotations")
+async def get_quotations(
+    status: Optional[QuotationStatus] = None,
+    distributor_id: Optional[str] = None,
+    user: User = Depends(get_current_user)
+):
+    """Get all quotations"""
+    query = {}
+    if status:
+        query["status"] = status.value
+    if distributor_id:
+        query["distributor_id"] = distributor_id
+    
+    quotations = await db.quotations.find(query, {"_id": 0}).sort("created_at", -1).to_list(1000)
+    return quotations
+
+@api_router.post("/quotations")
+async def create_quotation(qt_data: QuotationCreate, user: User = Depends(get_current_user)):
+    """Create a quotation"""
+    distributor = await db.distributors.find_one({"distributor_id": qt_data.distributor_id}, {"_id": 0})
+    if not distributor:
+        raise HTTPException(status_code=404, detail="Distributor not found")
+    
+    items = []
+    subtotal = 0.0
+    discount_total = 0.0
+    for item in qt_data.items:
+        product = await db.products.find_one({"product_id": item.product_id}, {"_id": 0})
+        line_total = item.quantity * item.unit_price
+        line_discount = line_total * (item.discount_percent / 100)
+        qt_item = QuotationItem(
+            product_id=item.product_id,
+            product_name=product["name"] if product else "Unknown",
+            quantity=item.quantity,
+            unit_price=item.unit_price,
+            discount_percent=item.discount_percent
+        )
+        items.append(qt_item.model_dump())
+        subtotal += line_total
+        discount_total += line_discount
+    
+    quotation = Quotation(
+        quotation_number=await generate_quotation_number(),
+        distributor_id=qt_data.distributor_id,
+        distributor_name=distributor["name"],
+        items=items,
+        subtotal=subtotal,
+        discount_amount=discount_total,
+        tax_amount=qt_data.tax_amount,
+        total_amount=subtotal - discount_total + qt_data.tax_amount,
+        valid_until=datetime.now(timezone.utc) + timedelta(days=qt_data.valid_days),
+        notes=qt_data.notes,
+        terms=qt_data.terms,
+        created_by=user.user_id
+    )
+    
+    await db.quotations.insert_one(quotation.model_dump())
+    await create_audit_log(user.user_id, "create", "quotation", quotation.quotation_id)
+    return quotation.model_dump()
+
+@api_router.put("/quotations/{quotation_id}/status")
+async def update_quotation_status(quotation_id: str, status: QuotationStatus, user: User = Depends(get_current_user)):
+    """Update quotation status"""
+    await db.quotations.update_one(
+        {"quotation_id": quotation_id},
+        {"$set": {"status": status.value}}
+    )
+    await create_audit_log(user.user_id, "update_status", "quotation", quotation_id, new_value={"status": status.value})
+    return await db.quotations.find_one({"quotation_id": quotation_id}, {"_id": 0})
+
+@api_router.post("/quotations/{quotation_id}/convert-to-order")
+async def convert_quotation_to_order(quotation_id: str, warehouse_id: str, user: User = Depends(get_current_user)):
+    """Convert accepted quotation to sales order"""
+    quotation = await db.quotations.find_one({"quotation_id": quotation_id}, {"_id": 0})
+    if not quotation:
+        raise HTTPException(status_code=404, detail="Quotation not found")
+    
+    if quotation["status"] != QuotationStatus.ACCEPTED.value:
+        raise HTTPException(status_code=400, detail="Only accepted quotations can be converted")
+    
+    # Create sales order from quotation
+    so_items = []
+    for item in quotation["items"]:
+        so_items.append({
+            "product_id": item["product_id"],
+            "quantity": item["quantity"],
+            "unit_price": item["unit_price"] * (1 - item.get("discount_percent", 0) / 100)
+        })
+    
+    so_data = SalesOrderCreate(
+        distributor_id=quotation["distributor_id"],
+        warehouse_id=warehouse_id,
+        items=[SalesOrderItemCreate(**item) for item in so_items],
+        tax_amount=quotation["tax_amount"],
+        notes=f"Created from {quotation['quotation_number']}"
+    )
+    
+    # Reuse existing create function logic
+    distributor = await db.distributors.find_one({"distributor_id": so_data.distributor_id}, {"_id": 0})
+    items = []
+    subtotal = 0.0
+    for item in so_data.items:
+        product = await db.products.find_one({"product_id": item.product_id}, {"_id": 0})
+        so_item = SalesOrderItem(
+            product_id=item.product_id,
+            product_name=product["name"] if product else "Unknown",
+            quantity=item.quantity,
+            unit_price=item.unit_price
+        )
+        items.append(so_item.model_dump())
+        subtotal += item.quantity * item.unit_price
+    
+    so = SalesOrder(
+        so_number=await generate_so_number(),
+        distributor_id=so_data.distributor_id,
+        distributor_name=distributor["name"] if distributor else "Unknown",
+        warehouse_id=warehouse_id,
+        items=items,
+        subtotal=subtotal,
+        tax_amount=so_data.tax_amount,
+        total_amount=subtotal + so_data.tax_amount,
+        notes=so_data.notes,
+        created_by=user.user_id
+    )
+    
+    await db.sales_orders.insert_one(so.model_dump())
+    await create_audit_log(user.user_id, "convert", "quotation", quotation_id, new_value={"so_id": so.so_id})
+    
+    return {"message": "Quotation converted to sales order", "so_id": so.so_id, "so_number": so.so_number}
+
+# ========================
+# DELIVERY NOTE ENDPOINTS
+# ========================
+
+class DeliveryStatus(str, Enum):
+    PENDING = "pending"
+    IN_TRANSIT = "in_transit"
+    DELIVERED = "delivered"
+    RETURNED = "returned"
+
+class DeliveryNote(BaseModel):
+    delivery_id: str = Field(default_factory=lambda: f"dn_{uuid.uuid4().hex[:12]}")
+    delivery_number: str
+    so_id: str
+    so_number: Optional[str] = None
+    distributor_id: str
+    distributor_name: Optional[str] = None
+    warehouse_id: str
+    items: List[dict] = []
+    status: DeliveryStatus = DeliveryStatus.PENDING
+    delivery_date: Optional[datetime] = None
+    delivered_by: Optional[str] = None
+    received_by: Optional[str] = None
+    notes: Optional[str] = None
+    created_by: Optional[str] = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class DeliveryNoteCreate(BaseModel):
+    so_id: str
+    notes: Optional[str] = None
+
+async def generate_delivery_number():
+    count = await db.delivery_notes.count_documents({})
+    return f"DN-{datetime.now().strftime('%Y%m')}-{count + 1:04d}"
+
+@api_router.get("/delivery-notes")
+async def get_delivery_notes(
+    status: Optional[DeliveryStatus] = None,
+    so_id: Optional[str] = None,
+    user: User = Depends(get_current_user)
+):
+    """Get all delivery notes"""
+    query = {}
+    if status:
+        query["status"] = status.value
+    if so_id:
+        query["so_id"] = so_id
+    
+    notes = await db.delivery_notes.find(query, {"_id": 0}).sort("created_at", -1).to_list(1000)
+    return notes
+
+@api_router.post("/delivery-notes")
+async def create_delivery_note(dn_data: DeliveryNoteCreate, user: User = Depends(get_current_user)):
+    """Create a delivery note from sales order"""
+    so = await db.sales_orders.find_one({"so_id": dn_data.so_id}, {"_id": 0})
+    if not so:
+        raise HTTPException(status_code=404, detail="Sales order not found")
+    
+    delivery = DeliveryNote(
+        delivery_number=await generate_delivery_number(),
+        so_id=so["so_id"],
+        so_number=so["so_number"],
+        distributor_id=so["distributor_id"],
+        distributor_name=so.get("distributor_name"),
+        warehouse_id=so["warehouse_id"],
+        items=so.get("items", []),
+        notes=dn_data.notes,
+        created_by=user.user_id
+    )
+    
+    await db.delivery_notes.insert_one(delivery.model_dump())
+    await create_audit_log(user.user_id, "create", "delivery_note", delivery.delivery_id)
+    return delivery.model_dump()
+
+@api_router.put("/delivery-notes/{delivery_id}/status")
+async def update_delivery_status(
+    delivery_id: str,
+    status: DeliveryStatus,
+    received_by: Optional[str] = None,
+    user: User = Depends(get_current_user)
+):
+    """Update delivery note status"""
+    update_data = {"status": status.value}
+    if status == DeliveryStatus.DELIVERED:
+        update_data["delivery_date"] = datetime.now(timezone.utc)
+        update_data["delivered_by"] = user.user_id
+        if received_by:
+            update_data["received_by"] = received_by
+        
+        # Update sales order status
+        delivery = await db.delivery_notes.find_one({"delivery_id": delivery_id}, {"_id": 0})
+        if delivery:
+            await db.sales_orders.update_one(
+                {"so_id": delivery["so_id"]},
+                {"$set": {"status": OrderStatus.DELIVERED.value, "updated_at": datetime.now(timezone.utc)}}
+            )
+    
+    await db.delivery_notes.update_one({"delivery_id": delivery_id}, {"$set": update_data})
+    await create_audit_log(user.user_id, "update_status", "delivery_note", delivery_id, new_value={"status": status.value})
+    return await db.delivery_notes.find_one({"delivery_id": delivery_id}, {"_id": 0})
+
+# ========================
+# BILL OF MATERIALS (BOM) ENDPOINTS
+# ========================
+
+class BOMItem(BaseModel):
+    raw_product_id: str
+    raw_product_name: Optional[str] = None
+    quantity_required: float
+    unit: Optional[str] = None
+
+class BillOfMaterials(BaseModel):
+    bom_id: str = Field(default_factory=lambda: f"bom_{uuid.uuid4().hex[:12]}")
+    finished_product_id: str
+    finished_product_name: Optional[str] = None
+    components: List[BOMItem] = []
+    yield_quantity: float = 1.0
+    notes: Optional[str] = None
+    is_active: bool = True
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class BOMItemCreate(BaseModel):
+    raw_product_id: str
+    quantity_required: float
+
+class BOMCreate(BaseModel):
+    finished_product_id: str
+    components: List[BOMItemCreate] = []
+    yield_quantity: float = 1.0
+    notes: Optional[str] = None
+
+@api_router.get("/bom")
+async def get_all_bom(user: User = Depends(get_current_user)):
+    """Get all BOMs"""
+    boms = await db.bill_of_materials.find({"is_active": True}, {"_id": 0}).to_list(1000)
+    return boms
+
+@api_router.get("/bom/{product_id}")
+async def get_bom_for_product(product_id: str, user: User = Depends(get_current_user)):
+    """Get BOM for a finished product"""
+    bom = await db.bill_of_materials.find_one({"finished_product_id": product_id, "is_active": True}, {"_id": 0})
+    if not bom:
+        raise HTTPException(status_code=404, detail="BOM not found")
+    return bom
+
+@api_router.post("/bom")
+async def create_bom(bom_data: BOMCreate, user: User = Depends(get_current_user)):
+    """Create a BOM for a finished product"""
+    # Verify finished product exists and is finished category
+    finished = await db.products.find_one({"product_id": bom_data.finished_product_id}, {"_id": 0})
+    if not finished:
+        raise HTTPException(status_code=404, detail="Finished product not found")
+    if finished["category"] != "finished":
+        raise HTTPException(status_code=400, detail="BOM can only be created for finished products")
+    
+    # Build components with names
+    components = []
+    for comp in bom_data.components:
+        raw = await db.products.find_one({"product_id": comp.raw_product_id}, {"_id": 0})
+        if not raw:
+            raise HTTPException(status_code=404, detail=f"Raw material {comp.raw_product_id} not found")
+        components.append(BOMItem(
+            raw_product_id=comp.raw_product_id,
+            raw_product_name=raw["name"],
+            quantity_required=comp.quantity_required,
+            unit=raw.get("unit")
+        ).model_dump())
+    
+    bom = BillOfMaterials(
+        finished_product_id=bom_data.finished_product_id,
+        finished_product_name=finished["name"],
+        components=components,
+        yield_quantity=bom_data.yield_quantity,
+        notes=bom_data.notes
+    )
+    
+    # Deactivate existing BOM for this product
+    await db.bill_of_materials.update_many(
+        {"finished_product_id": bom_data.finished_product_id},
+        {"$set": {"is_active": False}}
+    )
+    
+    await db.bill_of_materials.insert_one(bom.model_dump())
+    await create_audit_log(user.user_id, "create", "bom", bom.bom_id)
+    return bom.model_dump()
+
+@api_router.post("/bom/{bom_id}/produce")
+async def produce_from_bom(
+    bom_id: str,
+    quantity: float,
+    warehouse_id: str,
+    user: User = Depends(get_current_user)
+):
+    """Produce finished goods from raw materials using BOM"""
+    bom = await db.bill_of_materials.find_one({"bom_id": bom_id, "is_active": True}, {"_id": 0})
+    if not bom:
+        raise HTTPException(status_code=404, detail="BOM not found")
+    
+    # Check if all raw materials are available
+    multiplier = quantity / bom["yield_quantity"]
+    for comp in bom["components"]:
+        stock = await db.inventory_stock.find_one({
+            "product_id": comp["raw_product_id"],
+            "warehouse_id": warehouse_id
+        }, {"_id": 0})
+        required = comp["quantity_required"] * multiplier
+        available = stock.get("quantity", 0) if stock else 0
+        if available < required:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Insufficient {comp['raw_product_name']}: need {required}, have {available}"
+            )
+    
+    # Deduct raw materials
+    for comp in bom["components"]:
+        required = comp["quantity_required"] * multiplier
+        stock = await db.inventory_stock.find_one({
+            "product_id": comp["raw_product_id"],
+            "warehouse_id": warehouse_id
+        }, {"_id": 0})
+        new_qty = stock["quantity"] - required
+        await db.inventory_stock.update_one(
+            {"stock_id": stock["stock_id"]},
+            {"$set": {"quantity": new_qty, "last_updated": datetime.now(timezone.utc)}}
+        )
+        # Record transaction
+        await db.stock_transactions.insert_one(StockTransaction(
+            product_id=comp["raw_product_id"],
+            warehouse_id=warehouse_id,
+            type=TransactionType.PRODUCTION,
+            quantity=-required,
+            reference_id=bom_id,
+            notes=f"Used in production of {bom['finished_product_name']}",
+            created_by=user.user_id
+        ).model_dump())
+    
+    # Add finished goods
+    finished_stock = await db.inventory_stock.find_one({
+        "product_id": bom["finished_product_id"],
+        "warehouse_id": warehouse_id
+    }, {"_id": 0})
+    
+    if finished_stock:
+        new_qty = finished_stock["quantity"] + quantity
+        await db.inventory_stock.update_one(
+            {"stock_id": finished_stock["stock_id"]},
+            {"$set": {"quantity": new_qty, "last_updated": datetime.now(timezone.utc)}}
+        )
+    else:
+        new_stock = InventoryStock(
+            product_id=bom["finished_product_id"],
+            warehouse_id=warehouse_id,
+            quantity=quantity
+        )
+        await db.inventory_stock.insert_one(new_stock.model_dump())
+    
+    # Record finished goods transaction
+    await db.stock_transactions.insert_one(StockTransaction(
+        product_id=bom["finished_product_id"],
+        warehouse_id=warehouse_id,
+        type=TransactionType.PRODUCTION,
+        quantity=quantity,
+        reference_id=bom_id,
+        notes=f"Produced from BOM",
+        created_by=user.user_id
+    ).model_dump())
+    
+    await create_audit_log(user.user_id, "produce", "bom", bom_id, new_value={"quantity": quantity})
+    return {"message": f"Produced {quantity} units of {bom['finished_product_name']}"}
+
+# ========================
+# ENHANCED FINANCIAL REPORTS
+# ========================
+
+@api_router.get("/reports/profit-loss")
+async def get_profit_loss_report(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    user: User = Depends(get_current_user)
+):
+    """Get Profit & Loss report"""
+    # Default to current month
+    if not start_date:
+        start_date = datetime.now(timezone.utc).replace(day=1).isoformat()
+    if not end_date:
+        end_date = datetime.now(timezone.utc).isoformat()
+    
+    start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00')) if 'Z' in start_date or '+' in start_date else datetime.fromisoformat(start_date).replace(tzinfo=timezone.utc)
+    end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00')) if 'Z' in end_date or '+' in end_date else datetime.fromisoformat(end_date).replace(tzinfo=timezone.utc)
+    
+    # Calculate Revenue (from delivered/paid sales orders)
+    sales = await db.sales_orders.find({
+        "order_date": {"$gte": start_dt, "$lte": end_dt},
+        "status": {"$in": ["delivered", "paid"]}
+    }, {"_id": 0}).to_list(10000)
+    total_revenue = sum(so.get("total_amount", 0) for so in sales)
+    
+    # Calculate Cost of Goods Sold (from received/paid purchase orders)
+    purchases = await db.purchase_orders.find({
+        "order_date": {"$gte": start_dt, "$lte": end_dt},
+        "status": {"$in": ["received", "paid"]}
+    }, {"_id": 0}).to_list(10000)
+    total_cogs = sum(po.get("total_amount", 0) for po in purchases)
+    
+    # Calculate Expenses
+    expenses = await db.expenses.find({
+        "expense_date": {"$gte": start_dt, "$lte": end_dt},
+        "approved": True
+    }, {"_id": 0}).to_list(10000)
+    total_expenses = sum(exp.get("amount", 0) for exp in expenses)
+    
+    # Expense breakdown by category
+    expense_by_category = {}
+    for exp in expenses:
+        cat = exp.get("category", "other")
+        expense_by_category[cat] = expense_by_category.get(cat, 0) + exp.get("amount", 0)
+    
+    gross_profit = total_revenue - total_cogs
+    net_profit = gross_profit - total_expenses
+    gross_margin = (gross_profit / total_revenue * 100) if total_revenue > 0 else 0
+    net_margin = (net_profit / total_revenue * 100) if total_revenue > 0 else 0
+    
+    return {
+        "period": {"start": start_date, "end": end_date},
+        "revenue": {
+            "total_sales": round(total_revenue, 2),
+            "sales_count": len(sales)
+        },
+        "cost_of_goods_sold": {
+            "total_cogs": round(total_cogs, 2),
+            "purchase_count": len(purchases)
+        },
+        "gross_profit": round(gross_profit, 2),
+        "gross_margin_percent": round(gross_margin, 2),
+        "operating_expenses": {
+            "total": round(total_expenses, 2),
+            "by_category": {k: round(v, 2) for k, v in expense_by_category.items()}
+        },
+        "net_profit": round(net_profit, 2),
+        "net_margin_percent": round(net_margin, 2)
+    }
+
+@api_router.get("/reports/cash-flow")
+async def get_cash_flow_report(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    user: User = Depends(get_current_user)
+):
+    """Get Cash Flow report"""
+    if not start_date:
+        start_date = datetime.now(timezone.utc).replace(day=1).isoformat()
+    if not end_date:
+        end_date = datetime.now(timezone.utc).isoformat()
+    
+    start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00')) if 'Z' in start_date or '+' in start_date else datetime.fromisoformat(start_date).replace(tzinfo=timezone.utc)
+    end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00')) if 'Z' in end_date or '+' in end_date else datetime.fromisoformat(end_date).replace(tzinfo=timezone.utc)
+    
+    # Cash Inflows (payments received)
+    inflow_payments = await db.payments.find({
+        "payment_date": {"$gte": start_dt, "$lte": end_dt}
+    }, {"_id": 0}).to_list(10000)
+    
+    cash_inflows = 0.0
+    cash_outflows = 0.0
+    inflow_details = []
+    outflow_details = []
+    
+    for payment in inflow_payments:
+        invoice = await db.invoices.find_one({"invoice_id": payment["invoice_id"]}, {"_id": 0})
+        if invoice:
+            if invoice["type"] == "sale":
+                cash_inflows += payment["amount"]
+                inflow_details.append({
+                    "date": payment["payment_date"],
+                    "amount": payment["amount"],
+                    "source": invoice.get("party_name", "Customer"),
+                    "method": payment.get("method")
+                })
+            else:
+                cash_outflows += payment["amount"]
+                outflow_details.append({
+                    "date": payment["payment_date"],
+                    "amount": payment["amount"],
+                    "destination": invoice.get("party_name", "Supplier"),
+                    "method": payment.get("method"),
+                    "type": "supplier_payment"
+                })
+    
+    # Add expenses to outflows
+    expenses = await db.expenses.find({
+        "expense_date": {"$gte": start_dt, "$lte": end_dt},
+        "approved": True
+    }, {"_id": 0}).to_list(10000)
+    
+    for exp in expenses:
+        cash_outflows += exp["amount"]
+        outflow_details.append({
+            "date": exp["expense_date"],
+            "amount": exp["amount"],
+            "destination": exp.get("vendor", exp["category"]),
+            "method": exp.get("payment_method"),
+            "type": "expense"
+        })
+    
+    net_cash_flow = cash_inflows - cash_outflows
+    
+    return {
+        "period": {"start": start_date, "end": end_date},
+        "cash_inflows": {
+            "total": round(cash_inflows, 2),
+            "count": len(inflow_details),
+            "details": inflow_details[-10:]  # Last 10
+        },
+        "cash_outflows": {
+            "total": round(cash_outflows, 2),
+            "count": len(outflow_details),
+            "details": outflow_details[-10:]
+        },
+        "net_cash_flow": round(net_cash_flow, 2)
+    }
+
+@api_router.get("/reports/supplier-aging")
+async def get_supplier_aging_report(user: User = Depends(get_current_user)):
+    """Get Supplier Aging (Accounts Payable) report"""
+    today = datetime.now(timezone.utc)
+    
+    # Get unpaid purchase invoices
+    invoices = await db.invoices.find({
+        "type": "purchase",
+        "status": {"$in": ["unpaid", "partial"]}
+    }, {"_id": 0}).to_list(10000)
+    
+    aging_buckets = {
+        "current": {"total": 0, "invoices": []},
+        "1_30_days": {"total": 0, "invoices": []},
+        "31_60_days": {"total": 0, "invoices": []},
+        "61_90_days": {"total": 0, "invoices": []},
+        "over_90_days": {"total": 0, "invoices": []}
+    }
+    
+    by_supplier = {}
+    
+    for inv in invoices:
+        due_date = inv.get("due_date")
+        if isinstance(due_date, str):
+            due_date = datetime.fromisoformat(due_date.replace('Z', '+00:00'))
+        
+        days_overdue = (today - due_date).days if due_date else 0
+        outstanding = inv["total"] - inv.get("paid_amount", 0)
+        
+        inv_summary = {
+            "invoice_number": inv["invoice_number"],
+            "party_name": inv.get("party_name"),
+            "amount": outstanding,
+            "due_date": inv.get("due_date"),
+            "days_overdue": max(0, days_overdue)
+        }
+        
+        if days_overdue <= 0:
+            bucket = "current"
+        elif days_overdue <= 30:
+            bucket = "1_30_days"
+        elif days_overdue <= 60:
+            bucket = "31_60_days"
+        elif days_overdue <= 90:
+            bucket = "61_90_days"
+        else:
+            bucket = "over_90_days"
+        
+        aging_buckets[bucket]["total"] += outstanding
+        aging_buckets[bucket]["invoices"].append(inv_summary)
+        
+        supplier_id = inv.get("party_id")
+        if supplier_id not in by_supplier:
+            by_supplier[supplier_id] = {
+                "name": inv.get("party_name"),
+                "total": 0,
+                "current": 0,
+                "overdue": 0
+            }
+        by_supplier[supplier_id]["total"] += outstanding
+        if days_overdue > 0:
+            by_supplier[supplier_id]["overdue"] += outstanding
+        else:
+            by_supplier[supplier_id]["current"] += outstanding
+    
+    total_payable = sum(b["total"] for b in aging_buckets.values())
+    
+    return {
+        "total_accounts_payable": round(total_payable, 2),
+        "aging_summary": {k: round(v["total"], 2) for k, v in aging_buckets.items()},
+        "aging_details": {k: {"total": round(v["total"], 2), "invoices": v["invoices"][:5]} for k, v in aging_buckets.items()},
+        "by_supplier": list(by_supplier.values())
+    }
+
+@api_router.get("/reports/customer-aging")
+async def get_customer_aging_report(user: User = Depends(get_current_user)):
+    """Get Customer Aging (Accounts Receivable) report"""
+    today = datetime.now(timezone.utc)
+    
+    # Get unpaid sales invoices
+    invoices = await db.invoices.find({
+        "type": "sale",
+        "status": {"$in": ["unpaid", "partial"]}
+    }, {"_id": 0}).to_list(10000)
+    
+    aging_buckets = {
+        "current": {"total": 0, "invoices": []},
+        "1_30_days": {"total": 0, "invoices": []},
+        "31_60_days": {"total": 0, "invoices": []},
+        "61_90_days": {"total": 0, "invoices": []},
+        "over_90_days": {"total": 0, "invoices": []}
+    }
+    
+    by_customer = {}
+    
+    for inv in invoices:
+        due_date = inv.get("due_date")
+        if isinstance(due_date, str):
+            due_date = datetime.fromisoformat(due_date.replace('Z', '+00:00'))
+        
+        days_overdue = (today - due_date).days if due_date else 0
+        outstanding = inv["total"] - inv.get("paid_amount", 0)
+        
+        inv_summary = {
+            "invoice_number": inv["invoice_number"],
+            "party_name": inv.get("party_name"),
+            "amount": outstanding,
+            "due_date": inv.get("due_date"),
+            "days_overdue": max(0, days_overdue)
+        }
+        
+        if days_overdue <= 0:
+            bucket = "current"
+        elif days_overdue <= 30:
+            bucket = "1_30_days"
+        elif days_overdue <= 60:
+            bucket = "31_60_days"
+        elif days_overdue <= 90:
+            bucket = "61_90_days"
+        else:
+            bucket = "over_90_days"
+        
+        aging_buckets[bucket]["total"] += outstanding
+        aging_buckets[bucket]["invoices"].append(inv_summary)
+        
+        customer_id = inv.get("party_id")
+        if customer_id not in by_customer:
+            by_customer[customer_id] = {
+                "name": inv.get("party_name"),
+                "total": 0,
+                "current": 0,
+                "overdue": 0
+            }
+        by_customer[customer_id]["total"] += outstanding
+        if days_overdue > 0:
+            by_customer[customer_id]["overdue"] += outstanding
+        else:
+            by_customer[customer_id]["current"] += outstanding
+    
+    total_receivable = sum(b["total"] for b in aging_buckets.values())
+    
+    return {
+        "total_accounts_receivable": round(total_receivable, 2),
+        "aging_summary": {k: round(v["total"], 2) for k, v in aging_buckets.items()},
+        "aging_details": {k: {"total": round(v["total"], 2), "invoices": v["invoices"][:5]} for k, v in aging_buckets.items()},
+        "by_customer": list(by_customer.values())
+    }
+
+@api_router.get("/reports/inventory-valuation")
+async def get_inventory_valuation_report(
+    method: str = "average",  # average, fifo, lifo
+    warehouse_id: Optional[str] = None,
+    user: User = Depends(get_current_user)
+):
+    """Get Inventory Valuation report"""
+    query = {}
+    if warehouse_id:
+        query["warehouse_id"] = warehouse_id
+    
+    stocks = await db.inventory_stock.find(query, {"_id": 0}).to_list(10000)
+    
+    valuation = []
+    total_value = 0.0
+    total_items = 0
+    
+    for stock in stocks:
+        product = await db.products.find_one({"product_id": stock["product_id"]}, {"_id": 0})
+        if not product:
+            continue
+        
+        warehouse = await db.warehouses.find_one({"warehouse_id": stock["warehouse_id"]}, {"_id": 0})
+        
+        qty = stock.get("quantity", 0)
+        cost = product.get("cost_price", 0)
+        value = qty * cost
+        
+        valuation.append({
+            "product_id": stock["product_id"],
+            "product_name": product["name"],
+            "sku": product["sku"],
+            "category": product.get("category"),
+            "warehouse_id": stock["warehouse_id"],
+            "warehouse_name": warehouse["name"] if warehouse else "Unknown",
+            "quantity": qty,
+            "unit": product.get("unit"),
+            "unit_cost": cost,
+            "total_value": round(value, 2),
+            "selling_price": product.get("selling_price", 0),
+            "potential_revenue": round(qty * product.get("selling_price", 0), 2)
+        })
+        
+        total_value += value
+        total_items += qty
+    
+    # Sort by value descending
+    valuation.sort(key=lambda x: x["total_value"], reverse=True)
+    
+    return {
+        "valuation_method": method,
+        "total_inventory_value": round(total_value, 2),
+        "total_items": total_items,
+        "total_skus": len(valuation),
+        "items": valuation,
+        "top_5_by_value": valuation[:5]
+    }
+
+# ========================
+# NOTIFICATION SYSTEM
+# ========================
+
+class NotificationType(str, Enum):
+    LOW_STOCK = "low_stock"
+    ORDER_STATUS = "order_status"
+    PAYMENT_DUE = "payment_due"
+    APPROVAL_REQUIRED = "approval_required"
+    SYSTEM = "system"
+
+async def create_notification(user_id: str, title: str, message: str, notif_type: NotificationType):
+    """Helper to create notifications"""
+    notif = Notification(
+        user_id=user_id,
+        title=title,
+        message=message,
+        type=notif_type.value
+    )
+    await db.notifications.insert_one(notif.model_dump())
+    return notif
+
+@api_router.get("/notifications/generate-alerts")
+async def generate_system_alerts(user: User = Depends(get_current_user)):
+    """Generate system alerts for low stock, overdue payments, etc."""
+    alerts_generated = []
+    
+    # Low stock alerts
+    products = await db.products.find({"is_active": True}, {"_id": 0}).to_list(1000)
+    for product in products:
+        stocks = await db.inventory_stock.find({"product_id": product["product_id"]}, {"_id": 0}).to_list(100)
+        total_qty = sum(s.get("quantity", 0) for s in stocks)
+        if total_qty <= product.get("reorder_level", 10):
+            await create_notification(
+                user.user_id,
+                f"Low Stock Alert: {product['name']}",
+                f"{product['name']} is low on stock. Current: {total_qty}, Reorder Level: {product['reorder_level']}",
+                NotificationType.LOW_STOCK
+            )
+            alerts_generated.append({"type": "low_stock", "product": product["name"]})
+    
+    # Overdue invoices
+    today = datetime.now(timezone.utc)
+    overdue_invoices = await db.invoices.find({
+        "status": {"$in": ["unpaid", "partial"]},
+        "due_date": {"$lt": today}
+    }, {"_id": 0}).to_list(100)
+    
+    for inv in overdue_invoices:
+        await create_notification(
+            user.user_id,
+            f"Payment Overdue: {inv['invoice_number']}",
+            f"Invoice {inv['invoice_number']} for {inv.get('party_name')} is overdue. Amount: ${inv['total'] - inv.get('paid_amount', 0):.2f}",
+            NotificationType.PAYMENT_DUE
+        )
+        alerts_generated.append({"type": "payment_due", "invoice": inv["invoice_number"]})
+    
+    return {"alerts_generated": len(alerts_generated), "alerts": alerts_generated}
 
 # ========================
 # HEALTH CHECK

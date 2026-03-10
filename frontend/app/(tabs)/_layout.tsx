@@ -19,7 +19,7 @@ export default function TabLayout() {
       <Tabs.Screen
         name="index"
         options={{
-          title: 'Dashboard',
+          title: 'Home',
           tabBarIcon: ({ focused, color }) => (
             <Ionicons
               name={focused ? 'grid' : 'grid-outline'}
@@ -62,6 +62,32 @@ export default function TabLayout() {
           tabBarIcon: ({ focused, color }) => (
             <Ionicons
               name={focused ? 'people' : 'people-outline'}
+              size={22}
+              color={color}
+            />
+          ),
+        }}
+      />
+      <Tabs.Screen
+        name="finance"
+        options={{
+          title: 'Finance',
+          tabBarIcon: ({ focused, color }) => (
+            <Ionicons
+              name={focused ? 'wallet' : 'wallet-outline'}
+              size={22}
+              color={color}
+            />
+          ),
+        }}
+      />
+      <Tabs.Screen
+        name="reports"
+        options={{
+          title: 'Reports',
+          tabBarIcon: ({ focused, color }) => (
+            <Ionicons
+              name={focused ? 'stats-chart' : 'stats-chart-outline'}
               size={22}
               color={color}
             />
