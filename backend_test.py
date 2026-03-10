@@ -10,7 +10,7 @@ import sys
 from datetime import datetime, timedelta
 
 # Configuration
-BASE_URL = "https://biz-command-23.preview.emergentagent.com/api"
+BASE_URL = "https://erp-mobile-dev.preview.emergentagent.com/api"
 TEST_SESSION_TOKEN = "test_session_1773136094446"
 TEST_WAREHOUSE_ID = "wh_34f9fdd695e1"
 

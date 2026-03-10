@@ -24,6 +24,8 @@ import {
 } from '../../src/components/ThemedComponents';
 import { useAppStore } from '../../src/store/appStore';
 import { Product, ProductCategory } from '../../src/types';
+import { BarcodeScanner } from '../../src/components/BarcodeScanner';
+import clientConfig, { isFeatureEnabled } from '../../src/config/clientConfig';
 
 export default function InventoryScreen() {
   const {
@@ -44,6 +46,7 @@ export default function InventoryScreen() {
   const [showAddModal, setShowAddModal] = useState(false);
   const [showDetailModal, setShowDetailModal] = useState(false);
   const [showAdjustModal, setShowAdjustModal] = useState(false);
+  const [showBarcodeScanner, setShowBarcodeScanner] = useState(false);
   const [selectedProduct, setSelectedProduct] = useState<Product | null>(null);
   const [activeTab, setActiveTab] = useState<'products' | 'stock'>('products');
   const [searchQuery, setSearchQuery] = useState('');
@@ -213,6 +216,21 @@ export default function InventoryScreen() {
     setShowDetailModal(true);
   };
 
+  const handleBarcodeProductFound = (product: any, stock: number) => {
+    Alert.alert(
+      'Product Found',
+      `${product.name}\nSKU: ${product.sku}\nStock: ${stock} ${product.unit}`,
+      [
+        { text: 'View Details', onPress: () => openProductDetail(product) },
+        { text: 'Adjust Stock', onPress: () => {
+          setSelectedProduct(product);
+          setShowAdjustModal(true);
+        }},
+        { text: 'Close', style: 'cancel' },
+      ]
+    );
+  };
+
   const getProductStock = (productId: string) => {
     const stocks = inventory.filter((s) => s.product_id === productId);
     return stocks.reduce((sum, s) => sum + s.quantity, 0);
@@ -248,15 +266,25 @@ export default function InventoryScreen() {
       {/* Header */}
       <View style={styles.header}>
         <Text style={styles.title}>Inventory</Text>
-        <TouchableOpacity
-          style={styles.addButton}
-          onPress={() => {
-            resetForm();
-            setShowAddModal(true);
-          }}
-        >
-          <Ionicons name="add" size={24} color={Colors.text} />
-        </TouchableOpacity>
+        <View style={styles.headerButtons}>
+          {isFeatureEnabled('enableBarcodeScan') && (
+            <TouchableOpacity
+              style={styles.scanButton}
+              onPress={() => setShowBarcodeScanner(true)}
+            >
+              <Ionicons name="barcode-outline" size={24} color={Colors.text} />
+            </TouchableOpacity>
+          )}
+          <TouchableOpacity
+            style={styles.addButton}
+            onPress={() => {
+              resetForm();
+              setShowAddModal(true);
+            }}
+          >
+            <Ionicons name="add" size={24} color={Colors.text} />
+          </TouchableOpacity>
+        </View>
       </View>
 
       {/* Tabs */}
@@ -751,6 +779,15 @@ export default function InventoryScreen() {
           </View>
         </View>
       </Modal>
+
+      {/* Barcode Scanner */}
+      {isFeatureEnabled('enableBarcodeScan') && (
+        <BarcodeScanner
+          visible={showBarcodeScanner}
+          onClose={() => setShowBarcodeScanner(false)}
+          onProductFound={handleBarcodeProductFound}
+        />
+      )}
     </SafeAreaView>
   );
 }
@@ -766,6 +803,20 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     paddingHorizontal: 20,
     paddingVertical: 16,
+  },
+  headerButtons: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  scanButton: {
+    width: 44,
+    height: 44,
+    borderRadius: 12,
+    backgroundColor: Colors.cardAlt,
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: Colors.border,
   },
   title: {
     fontSize: 28,

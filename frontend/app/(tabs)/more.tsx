@@ -8,6 +8,7 @@ import {
   Modal,
   Alert,
   RefreshControl,
+  Linking,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
@@ -23,6 +24,9 @@ import {
 } from '../../src/components/ThemedComponents';
 import { useAuthStore } from '../../src/store/authStore';
 import { useAppStore } from '../../src/store/appStore';
+import { useSyncStore } from '../../src/store/syncStore';
+import { SyncStatusIndicator } from '../../src/components/SyncStatusIndicator';
+import clientConfig, { isFeatureEnabled } from '../../src/config/clientConfig';
 import api from '../../src/utils/api';
 
 export default function MoreScreen() {
@@ -254,8 +258,14 @@ export default function MoreScreen() {
 
         {/* App Info */}
         <View style={styles.appInfo}>
-          <Text style={styles.appName}>BizCore</Text>
+          <Text style={styles.appName}>{clientConfig.appName}</Text>
           <Text style={styles.appVersion}>Version 1.0.0</Text>
+          <Text style={styles.appTagline}>{clientConfig.tagline}</Text>
+          {isFeatureEnabled('enableOfflineMode') && (
+            <View style={{ marginTop: 12 }}>
+              <SyncStatusIndicator />
+            </View>
+          )}
         </View>
 
         <View style={{ height: 100 }} />
@@ -562,6 +572,12 @@ const styles = StyleSheet.create({
     fontSize: 13,
     color: Colors.textMuted,
     marginTop: 4,
+  },
+  appTagline: {
+    fontSize: 12,
+    color: Colors.textSecondary,
+    marginTop: 4,
+    fontStyle: 'italic',
   },
   modalOverlay: {
     flex: 1,
