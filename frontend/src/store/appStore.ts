@@ -75,6 +75,10 @@ interface AppState {
   updateSalesOrder: (id: string, data: any) => Promise<SalesOrder>;
   
   adjustInventory: (data: any) => Promise<void>;
+  
+  // Notifications
+  markNotificationRead: (notificationId: string) => Promise<void>;
+  markAllNotificationsRead: () => Promise<void>;
 }
 
 export const useAppStore = create<AppState>((set, get) => ({
@@ -309,5 +313,21 @@ export const useAppStore = create<AppState>((set, get) => ({
   fetchNotifications: async () => {
     const response = await api.get('/notifications');
     set({ notifications: response.data });
+  },
+
+  markNotificationRead: async (notificationId: string) => {
+    await api.put(`/notifications/${notificationId}/read`);
+    set((state) => ({
+      notifications: state.notifications.map((n: any) =>
+        n.notification_id === notificationId ? { ...n, is_read: true } : n
+      ),
+    }));
+  },
+
+  markAllNotificationsRead: async () => {
+    await api.put('/notifications/read-all');
+    set((state) => ({
+      notifications: state.notifications.map((n: any) => ({ ...n, is_read: true })),
+    }));
   },
 }));
