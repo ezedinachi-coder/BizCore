@@ -1,5 +1,5 @@
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Response
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -12,6 +12,20 @@ from typing import List, Optional, Dict, Any
 import uuid
 from datetime import datetime, timezone, timedelta
 from enum import Enum
+import io
+import base64
+
+# PDF Generation imports
+try:
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import letter, A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import inch
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image
+    from reportlab.lib.enums import TA_CENTER, TA_RIGHT, TA_LEFT
+    PDF_AVAILABLE = True
+except ImportError:
+    PDF_AVAILABLE = False
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -2708,6 +2722,561 @@ async def generate_system_alerts(user: User = Depends(get_current_user)):
         alerts_generated.append({"type": "payment_due", "invoice": inv["invoice_number"]})
     
     return {"alerts_generated": len(alerts_generated), "alerts": alerts_generated}
+
+# ========================
+# PDF EXPORT ENDPOINTS
+# ========================
+
+def generate_invoice_pdf(invoice_data: dict, items: list, company_name: str = "BizCore") -> bytes:
+    """Generate PDF for an invoice"""
+    if not PDF_AVAILABLE:
+        raise HTTPException(status_code=500, detail="PDF generation not available")
+    
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter, topMargin=0.5*inch, bottomMargin=0.5*inch)
+    
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle('Title', parent=styles['Heading1'], fontSize=24, alignment=TA_CENTER, spaceAfter=20)
+    header_style = ParagraphStyle('Header', parent=styles['Normal'], fontSize=12, alignment=TA_LEFT)
+    
+    elements = []
+    
+    # Header
+    elements.append(Paragraph(company_name, title_style))
+    elements.append(Spacer(1, 0.2*inch))
+    
+    # Invoice info
+    inv_type = "SALES INVOICE" if invoice_data.get("type") == "sale" else "PURCHASE INVOICE"
+    elements.append(Paragraph(f"<b>{inv_type}</b>", ParagraphStyle('Type', fontSize=16, alignment=TA_CENTER)))
+    elements.append(Spacer(1, 0.2*inch))
+    
+    # Invoice details table
+    inv_number = invoice_data.get("invoice_number", "N/A")
+    issue_date = invoice_data.get("issue_date", "")
+    if isinstance(issue_date, datetime):
+        issue_date = issue_date.strftime("%Y-%m-%d")
+    due_date = invoice_data.get("due_date", "")
+    if isinstance(due_date, datetime):
+        due_date = due_date.strftime("%Y-%m-%d")
+    
+    details_data = [
+        ["Invoice Number:", inv_number, "Issue Date:", str(issue_date)[:10]],
+        ["Party:", invoice_data.get("party_name", "N/A"), "Due Date:", str(due_date)[:10]],
+        ["Status:", invoice_data.get("status", "").upper(), "", ""],
+    ]
+    
+    details_table = Table(details_data, colWidths=[1.5*inch, 2.5*inch, 1.2*inch, 1.5*inch])
+    details_table.setStyle(TableStyle([
+        ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
+        ('FONTSIZE', (0, 0), (-1, -1), 10),
+        ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+        ('FONTNAME', (2, 0), (2, -1), 'Helvetica-Bold'),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+    ]))
+    elements.append(details_table)
+    elements.append(Spacer(1, 0.3*inch))
+    
+    # Items table
+    if items:
+        items_header = ["#", "Product", "Quantity", "Unit Price", "Total"]
+        items_data = [items_header]
+        for i, item in enumerate(items, 1):
+            qty = item.get("quantity", 0)
+            price = item.get("unit_price", 0)
+            total = qty * price
+            items_data.append([
+                str(i),
+                item.get("product_name", "N/A"),
+                str(qty),
+                f"${price:.2f}",
+                f"${total:.2f}"
+            ])
+        
+        items_table = Table(items_data, colWidths=[0.5*inch, 3*inch, 1*inch, 1*inch, 1*inch])
+        items_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#6366F1')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, -1), 10),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#F3F4F6')),
+            ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#E5E7EB')),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#F9FAFB')]),
+        ]))
+        elements.append(items_table)
+        elements.append(Spacer(1, 0.3*inch))
+    
+    # Totals
+    subtotal = invoice_data.get("subtotal", 0)
+    tax = invoice_data.get("tax_amount", 0)
+    total = invoice_data.get("total", 0)
+    paid = invoice_data.get("paid_amount", 0)
+    
+    totals_data = [
+        ["", "", "Subtotal:", f"${subtotal:.2f}"],
+        ["", "", "Tax:", f"${tax:.2f}"],
+        ["", "", "Total:", f"${total:.2f}"],
+        ["", "", "Paid:", f"${paid:.2f}"],
+        ["", "", "Balance Due:", f"${(total - paid):.2f}"],
+    ]
+    
+    totals_table = Table(totals_data, colWidths=[2*inch, 2*inch, 1.5*inch, 1*inch])
+    totals_table.setStyle(TableStyle([
+        ('ALIGN', (2, 0), (-1, -1), 'RIGHT'),
+        ('FONTNAME', (2, 0), (2, -1), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -1), 10),
+        ('LINEABOVE', (2, -1), (-1, -1), 1, colors.black),
+        ('FONTNAME', (2, -1), (-1, -1), 'Helvetica-Bold'),
+        ('FONTSIZE', (2, -1), (-1, -1), 12),
+    ]))
+    elements.append(totals_table)
+    
+    # Footer
+    elements.append(Spacer(1, 0.5*inch))
+    elements.append(Paragraph("Thank you for your business!", ParagraphStyle('Footer', fontSize=10, alignment=TA_CENTER, textColor=colors.gray)))
+    elements.append(Paragraph(f"Generated by {company_name} on {datetime.now().strftime('%Y-%m-%d %H:%M')}", 
+                             ParagraphStyle('Footer2', fontSize=8, alignment=TA_CENTER, textColor=colors.gray)))
+    
+    doc.build(elements)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+@api_router.get("/invoices/{invoice_id}/pdf")
+async def get_invoice_pdf(invoice_id: str, user: User = Depends(get_current_user)):
+    """Generate and return invoice PDF"""
+    invoice = await db.invoices.find_one({"invoice_id": invoice_id}, {"_id": 0})
+    if not invoice:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    
+    # Get related order items
+    items = []
+    if invoice.get("type") == "sale":
+        so = await db.sales_orders.find_one({"so_id": invoice.get("reference_id")}, {"_id": 0})
+        if so:
+            items = so.get("items", [])
+    else:
+        po = await db.purchase_orders.find_one({"po_id": invoice.get("reference_id")}, {"_id": 0})
+        if po:
+            items = po.get("items", [])
+    
+    # Get company info
+    company = await db.companies.find_one({}, {"_id": 0})
+    company_name = company.get("name", "BizCore") if company else "BizCore"
+    
+    pdf_bytes = generate_invoice_pdf(invoice, items, company_name)
+    
+    return StreamingResponse(
+        io.BytesIO(pdf_bytes),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename=invoice_{invoice['invoice_number']}.pdf"}
+    )
+
+@api_router.get("/invoices/{invoice_id}/pdf-base64")
+async def get_invoice_pdf_base64(invoice_id: str, user: User = Depends(get_current_user)):
+    """Generate and return invoice PDF as base64 (for mobile)"""
+    invoice = await db.invoices.find_one({"invoice_id": invoice_id}, {"_id": 0})
+    if not invoice:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    
+    items = []
+    if invoice.get("type") == "sale":
+        so = await db.sales_orders.find_one({"so_id": invoice.get("reference_id")}, {"_id": 0})
+        if so:
+            items = so.get("items", [])
+    else:
+        po = await db.purchase_orders.find_one({"po_id": invoice.get("reference_id")}, {"_id": 0})
+        if po:
+            items = po.get("items", [])
+    
+    company = await db.companies.find_one({}, {"_id": 0})
+    company_name = company.get("name", "BizCore") if company else "BizCore"
+    
+    pdf_bytes = generate_invoice_pdf(invoice, items, company_name)
+    pdf_base64 = base64.b64encode(pdf_bytes).decode('utf-8')
+    
+    return {
+        "pdf_base64": pdf_base64,
+        "filename": f"invoice_{invoice['invoice_number']}.pdf"
+    }
+
+def generate_report_pdf(title: str, data: dict, report_type: str) -> bytes:
+    """Generate PDF for reports"""
+    if not PDF_AVAILABLE:
+        raise HTTPException(status_code=500, detail="PDF generation not available")
+    
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter, topMargin=0.5*inch, bottomMargin=0.5*inch)
+    
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle('Title', parent=styles['Heading1'], fontSize=20, alignment=TA_CENTER, spaceAfter=20)
+    
+    elements = []
+    
+    # Header
+    elements.append(Paragraph(title, title_style))
+    elements.append(Paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}", 
+                             ParagraphStyle('Date', fontSize=10, alignment=TA_CENTER, textColor=colors.gray)))
+    elements.append(Spacer(1, 0.3*inch))
+    
+    if report_type == "stock_summary":
+        # Stock summary table
+        items = data.get("items", [])
+        if items:
+            header = ["SKU", "Product", "Warehouse", "Qty", "Value"]
+            table_data = [header]
+            for item in items[:50]:  # Limit to 50 items
+                table_data.append([
+                    item.get("sku", ""),
+                    item.get("product_name", "")[:30],
+                    item.get("warehouse_name", "")[:15],
+                    str(item.get("quantity", 0)),
+                    f"${item.get('value', 0):.2f}"
+                ])
+            
+            table = Table(table_data, colWidths=[1*inch, 2.5*inch, 1.2*inch, 0.8*inch, 1*inch])
+            table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#6366F1')),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, -1), 9),
+                ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#E5E7EB')),
+                ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#F9FAFB')]),
+            ]))
+            elements.append(table)
+        
+        # Summary
+        elements.append(Spacer(1, 0.3*inch))
+        elements.append(Paragraph(f"<b>Total Inventory Value: ${data.get('total_inventory_value', 0):,.2f}</b>", 
+                                 ParagraphStyle('Summary', fontSize=14, alignment=TA_RIGHT)))
+    
+    elif report_type == "profit_loss":
+        pl_data = [
+            ["Revenue", f"${data.get('revenue', {}).get('total_sales', 0):,.2f}"],
+            ["Cost of Goods Sold", f"-${data.get('cost_of_goods_sold', {}).get('total_cogs', 0):,.2f}"],
+            ["Gross Profit", f"${data.get('gross_profit', 0):,.2f}"],
+            ["Operating Expenses", f"-${data.get('operating_expenses', {}).get('total', 0):,.2f}"],
+            ["Net Profit", f"${data.get('net_profit', 0):,.2f}"],
+        ]
+        
+        table = Table(pl_data, colWidths=[4*inch, 2*inch])
+        table.setStyle(TableStyle([
+            ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
+            ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
+            ('FONTSIZE', (0, 0), (-1, -1), 12),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 10),
+            ('LINEBELOW', (0, 2), (-1, 2), 1, colors.black),
+            ('LINEBELOW', (0, -1), (-1, -1), 2, colors.black),
+            ('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, -1), (-1, -1), 14),
+        ]))
+        elements.append(table)
+    
+    doc.build(elements)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+@api_router.get("/reports/stock-summary/pdf")
+async def get_stock_summary_pdf(warehouse_id: Optional[str] = None, user: User = Depends(get_current_user)):
+    """Generate stock summary report PDF"""
+    # Get the data
+    query = {}
+    if warehouse_id:
+        query["warehouse_id"] = warehouse_id
+    
+    stocks = await db.inventory_stock.find(query, {"_id": 0}).to_list(10000)
+    
+    items = []
+    total_value = 0.0
+    for stock in stocks:
+        product = await db.products.find_one({"product_id": stock["product_id"]}, {"_id": 0})
+        warehouse = await db.warehouses.find_one({"warehouse_id": stock["warehouse_id"]}, {"_id": 0})
+        
+        if product:
+            value = stock.get("quantity", 0) * product.get("cost_price", 0)
+            items.append({
+                "sku": product["sku"],
+                "product_name": product["name"],
+                "warehouse_name": warehouse["name"] if warehouse else "Unknown",
+                "quantity": stock.get("quantity", 0),
+                "value": value
+            })
+            total_value += value
+    
+    data = {"items": items, "total_inventory_value": total_value}
+    pdf_bytes = generate_report_pdf("Stock Summary Report", data, "stock_summary")
+    
+    return StreamingResponse(
+        io.BytesIO(pdf_bytes),
+        media_type="application/pdf",
+        headers={"Content-Disposition": "attachment; filename=stock_summary_report.pdf"}
+    )
+
+@api_router.get("/reports/profit-loss/pdf")
+async def get_profit_loss_pdf(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    user: User = Depends(get_current_user)
+):
+    """Generate P&L report PDF"""
+    # Reuse the existing P&L logic
+    if not start_date:
+        start_date = datetime.now(timezone.utc).replace(day=1).isoformat()
+    if not end_date:
+        end_date = datetime.now(timezone.utc).isoformat()
+    
+    start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00')) if 'Z' in start_date or '+' in start_date else datetime.fromisoformat(start_date).replace(tzinfo=timezone.utc)
+    end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00')) if 'Z' in end_date or '+' in end_date else datetime.fromisoformat(end_date).replace(tzinfo=timezone.utc)
+    
+    sales = await db.sales_orders.find({
+        "order_date": {"$gte": start_dt, "$lte": end_dt},
+        "status": {"$in": ["delivered", "paid"]}
+    }, {"_id": 0}).to_list(10000)
+    total_revenue = sum(so.get("total_amount", 0) for so in sales)
+    
+    purchases = await db.purchase_orders.find({
+        "order_date": {"$gte": start_dt, "$lte": end_dt},
+        "status": {"$in": ["received", "paid"]}
+    }, {"_id": 0}).to_list(10000)
+    total_cogs = sum(po.get("total_amount", 0) for po in purchases)
+    
+    expenses = await db.expenses.find({
+        "expense_date": {"$gte": start_dt, "$lte": end_dt},
+        "approved": True
+    }, {"_id": 0}).to_list(10000)
+    total_expenses = sum(exp.get("amount", 0) for exp in expenses)
+    
+    gross_profit = total_revenue - total_cogs
+    net_profit = gross_profit - total_expenses
+    
+    data = {
+        "revenue": {"total_sales": total_revenue},
+        "cost_of_goods_sold": {"total_cogs": total_cogs},
+        "gross_profit": gross_profit,
+        "operating_expenses": {"total": total_expenses},
+        "net_profit": net_profit
+    }
+    
+    pdf_bytes = generate_report_pdf("Profit & Loss Statement", data, "profit_loss")
+    
+    return StreamingResponse(
+        io.BytesIO(pdf_bytes),
+        media_type="application/pdf",
+        headers={"Content-Disposition": "attachment; filename=profit_loss_report.pdf"}
+    )
+
+# ========================
+# PUSH NOTIFICATION REGISTRATION
+# ========================
+
+class PushTokenRegister(BaseModel):
+    push_token: str
+    device_type: str = "unknown"  # ios, android, web
+
+@api_router.post("/notifications/register-push-token")
+async def register_push_token(token_data: PushTokenRegister, user: User = Depends(get_current_user)):
+    """Register push notification token for a user"""
+    await db.push_tokens.update_one(
+        {"user_id": user.user_id},
+        {
+            "$set": {
+                "user_id": user.user_id,
+                "push_token": token_data.push_token,
+                "device_type": token_data.device_type,
+                "updated_at": datetime.now(timezone.utc)
+            }
+        },
+        upsert=True
+    )
+    return {"message": "Push token registered"}
+
+@api_router.delete("/notifications/unregister-push-token")
+async def unregister_push_token(user: User = Depends(get_current_user)):
+    """Unregister push notification token"""
+    await db.push_tokens.delete_many({"user_id": user.user_id})
+    return {"message": "Push token unregistered"}
+
+@api_router.get("/notifications/push-tokens")
+async def get_push_tokens(user: User = Depends(get_current_user)):
+    """Get all push tokens (admin only)"""
+    if user.role not in [UserRole.SUPER_ADMIN, UserRole.MANAGER]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    tokens = await db.push_tokens.find({}, {"_id": 0}).to_list(1000)
+    return tokens
+
+# ========================
+# OFFLINE SYNC ENDPOINTS
+# ========================
+
+class SyncData(BaseModel):
+    entity_type: str  # products, suppliers, distributors, etc.
+    last_sync: Optional[str] = None
+    local_changes: List[Dict[str, Any]] = []
+
+@api_router.post("/sync/pull")
+async def sync_pull(sync_data: SyncData, user: User = Depends(get_current_user)):
+    """Pull data changes since last sync for offline mode"""
+    last_sync_dt = None
+    if sync_data.last_sync:
+        try:
+            last_sync_dt = datetime.fromisoformat(sync_data.last_sync.replace('Z', '+00:00'))
+        except:
+            pass
+    
+    query = {}
+    if last_sync_dt:
+        query["updated_at"] = {"$gt": last_sync_dt}
+    
+    collection_map = {
+        "products": db.products,
+        "suppliers": db.suppliers,
+        "distributors": db.distributors,
+        "warehouses": db.warehouses,
+        "inventory": db.inventory_stock,
+        "purchase_orders": db.purchase_orders,
+        "sales_orders": db.sales_orders,
+    }
+    
+    if sync_data.entity_type not in collection_map:
+        raise HTTPException(status_code=400, detail=f"Unknown entity type: {sync_data.entity_type}")
+    
+    collection = collection_map[sync_data.entity_type]
+    
+    # For inventory, we use last_updated instead of updated_at
+    if sync_data.entity_type == "inventory" and last_sync_dt:
+        query = {"last_updated": {"$gt": last_sync_dt}}
+    
+    data = await collection.find(query, {"_id": 0}).to_list(10000)
+    
+    return {
+        "entity_type": sync_data.entity_type,
+        "sync_time": datetime.now(timezone.utc).isoformat(),
+        "count": len(data),
+        "data": data
+    }
+
+@api_router.post("/sync/push")
+async def sync_push(sync_data: SyncData, user: User = Depends(get_current_user)):
+    """Push local changes to server for offline mode"""
+    if not sync_data.local_changes:
+        return {"message": "No changes to sync", "synced": 0}
+    
+    synced = 0
+    errors = []
+    
+    for change in sync_data.local_changes:
+        try:
+            action = change.get("action", "update")
+            entity_id = change.get("entity_id")
+            data = change.get("data", {})
+            
+            if sync_data.entity_type == "stock_adjustments":
+                # Handle stock adjustments
+                await db.stock_transactions.insert_one({
+                    **data,
+                    "created_by": user.user_id,
+                    "created_at": datetime.now(timezone.utc),
+                    "synced_from_offline": True
+                })
+                
+                # Update inventory
+                stock = await db.inventory_stock.find_one({
+                    "product_id": data.get("product_id"),
+                    "warehouse_id": data.get("warehouse_id")
+                }, {"_id": 0})
+                
+                if stock:
+                    new_qty = stock["quantity"] + data.get("quantity", 0)
+                    await db.inventory_stock.update_one(
+                        {"stock_id": stock["stock_id"]},
+                        {"$set": {"quantity": new_qty, "last_updated": datetime.now(timezone.utc)}}
+                    )
+                synced += 1
+            
+            elif sync_data.entity_type == "sales_orders" and action == "create":
+                # Create new sales order from offline
+                data["created_by"] = user.user_id
+                data["created_at"] = datetime.now(timezone.utc)
+                data["synced_from_offline"] = True
+                await db.sales_orders.insert_one(data)
+                synced += 1
+            
+            elif sync_data.entity_type == "purchase_orders" and action == "create":
+                # Create new purchase order from offline
+                data["created_by"] = user.user_id
+                data["created_at"] = datetime.now(timezone.utc)
+                data["synced_from_offline"] = True
+                await db.purchase_orders.insert_one(data)
+                synced += 1
+        
+        except Exception as e:
+            errors.append({"entity_id": entity_id, "error": str(e)})
+    
+    return {
+        "message": f"Synced {synced} changes",
+        "synced": synced,
+        "errors": errors
+    }
+
+@api_router.get("/sync/status")
+async def get_sync_status(user: User = Depends(get_current_user)):
+    """Get sync status for all entities"""
+    entities = ["products", "suppliers", "distributors", "warehouses", "purchase_orders", "sales_orders"]
+    
+    status = {}
+    for entity in entities:
+        collection = db[entity]
+        count = await collection.count_documents({})
+        latest = await collection.find_one({}, {"_id": 0, "updated_at": 1}, sort=[("updated_at", -1)])
+        status[entity] = {
+            "count": count,
+            "last_updated": latest.get("updated_at").isoformat() if latest and latest.get("updated_at") else None
+        }
+    
+    return {
+        "server_time": datetime.now(timezone.utc).isoformat(),
+        "entities": status
+    }
+
+# ========================
+# BARCODE LOOKUP
+# ========================
+
+@api_router.get("/barcode/{barcode}")
+async def lookup_barcode(barcode: str, user: User = Depends(get_current_user)):
+    """Look up product by barcode"""
+    product = await db.products.find_one({"barcode": barcode, "is_active": True}, {"_id": 0})
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
+    
+    # Get stock levels
+    stocks = await db.inventory_stock.find({"product_id": product["product_id"]}, {"_id": 0}).to_list(100)
+    total_stock = sum(s.get("quantity", 0) for s in stocks)
+    
+    return {
+        "product": product,
+        "total_stock": total_stock,
+        "stock_by_warehouse": stocks
+    }
+
+@api_router.post("/barcode/generate")
+async def generate_barcode(product_id: str, user: User = Depends(get_current_user)):
+    """Generate and assign barcode to product"""
+    product = await db.products.find_one({"product_id": product_id}, {"_id": 0})
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
+    
+    # Generate barcode (simple format: BZC + timestamp + random)
+    barcode = f"BZC{datetime.now().strftime('%y%m%d')}{uuid.uuid4().hex[:6].upper()}"
+    
+    await db.products.update_one(
+        {"product_id": product_id},
+        {"$set": {"barcode": barcode, "updated_at": datetime.now(timezone.utc)}}
+    )
+    
+    return {"product_id": product_id, "barcode": barcode}
 
 # ========================
 # HEALTH CHECK
