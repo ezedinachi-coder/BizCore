@@ -1,7 +1,7 @@
 {
   "expo": {
-    "name": "BizCore2",
-    "slug": "bizcore2",
+    "name": "BizCore",
+    "slug": "bizcore",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
